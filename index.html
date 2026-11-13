@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>HDR Boost — EDR test</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;min-height:100%;background:#08090c;color:#f4f4f5;font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  body{padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom)}
+  main{max-width:560px;margin:0 auto;padding:22px 0 30px}
+  h1{font-size:27px;margin:0 0 8px}
+  p{color:#b7bac3;line-height:1.45;margin:8px 0 16px}
+  #status{padding:12px 14px;border:1px solid #343743;border-radius:12px;background:#151821;margin:16px 0}
+  #status.good{border-color:#286c4b;color:#a9f2c8}
+  #status.bad{border-color:#80503a;color:#ffd0ad}
+  canvas{width:100%;height:360px;display:block;border-radius:14px;background:#111;margin:14px 0;touch-action:pan-y}
+  .small{font-size:13px;color:#9297a4}
+  button{width:100%;border:0;border-radius:12px;background:#f1f1f1;color:#111;font-size:16px;font-weight:650;padding:15px;margin:6px 0}
+  button:disabled{opacity:.45}
+  .row{display:flex;gap:10px}
+  .row button{flex:1}
+  .note{border-left:3px solid #7c86a5;padding-left:12px;margin-top:18px}
+  code{color:#d6dcff}
+</style>
+</head>
+<body>
+<main>
+  <h1>HDR Boost — EDR test</h1>
+  <p>Тест проверяет, может ли Safari вывести на дисплей значения яркости выше обычного SDR-белого. Это тестовая страница, не фильтр поверх других приложений.</p>
+  <div id="status">Проверяем поддержку WebGPU…</div>
+  <canvas id="c" width="900" height="900"></canvas>
+  <div class="row">
+    <button id="start">Включить EDR-тест</button>
+    <button id="stop" disabled>Остановить</button>
+  </div>
+  <p class="small">Плашки слева направо и сверху вниз: SDR 0.5×, 1×, затем EDR 1.25×, 1.5×, 2× и 3×. Сравнивай белые плашки: если EDR работает, последние должны выглядеть ярче обычного белого.</p>
+  <div class="note">
+    <p><b>Важно.</b> Увеличение значений выше 1.0 не гарантирует достижение паспортных 1200 нит: фактическая яркость зависит от iOS, температуры, уровня заряда и управления дисплеем. Видео Safari эта страница не изменяет.</p>
+  </div>
+</main>
+<script>
+const canvas = document.querySelector('#c');
+const statusBox = document.querySelector('#status');
+const startBtn = document.querySelector('#start');
+const stopBtn = document.querySelector('#stop');
+let device = null, running = false;
+
+function status(msg, cls='') {
+  statusBox.textContent = msg;
+  statusBox.className = cls;
+}
+function fallback() {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const vals = [0.5,1,1.25,1.5,2,3];
+  ctx.clearRect(0,0,900,900);
+  vals.forEach((v,i)=>{
+    const x=(i%2)*450, y=Math.floor(i/2)*300;
+    const c=Math.round(255*Math.min(1,v));
+    ctx.fillStyle=`rgb(${c},${c},${c})`;
+    ctx.fillRect(x+8,y+8,434,284);
+    ctx.fillStyle='#888'; ctx.font='28px sans-serif';
+    ctx.fillText(`${v.toFixed(2)}×`,x+24,y+48);
+  });
+}
+async function init() {
+  if (!('gpu' in navigator)) {
+    status('WebGPU недоступен. Нужен Safari на iOS 26 или новее.', 'bad');
+    fallback(); return;
+  }
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error('GPU-адаптер не найден');
+    device = await adapter.requestDevice();
+    const context = canvas.getContext('webgpu');
+    if (!context) throw new Error('WebGPU Canvas недоступен');
+    const format = 'rgba16float';
+    context.configure({
+      device,
+      format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      toneMapping: { mode: 'extended' },
+      colorSpace: 'display-p3'
+    });
+    const shader = device.createShaderModule({code: `
+      struct Out { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+      @vertex fn vs(@builtin(vertex_index) i:u32)->Out {
+        var p=array<vec2f,6>(
+          vec2f(-1.0,-1.0),vec2f(1.0,-1.0),vec2f(-1.0,1.0),
+          vec2f(-1.0,1.0),vec2f(1.0,-1.0),vec2f(1.0,1.0));
+        var o:Out; o.pos=vec4f(p[i],0.0,1.0); o.uv=p[i]*0.5+vec2f(0.5);
+        return o;
+      }
+      @fragment fn fs(in:Out)->@location(0) vec4f {
+        let x=in.uv.x; let y=in.uv.y;
+        let col=u32(clamp(floor(x*2.0),0.0,1.0));
+        let row=u32(clamp(floor(y*3.0),0.0,2.0));
+        let idx=row*2u+col;
+        var v=0.5;
+        if(idx==1u){v=1.0;}
+        if(idx==2u){v=1.25;}
+        if(idx==3u){v=1.5;}
+        if(idx==4u){v=2.0;}
+        if(idx==5u){v=3.0;}
+        let local=vec2f(fract(x*2.0),fract(y*3.0));
+        let border=local.x<0.025 || local.x>0.975 || local.y<0.025 || local.y>0.975;
+        if(border){return vec4f(0.025,0.025,0.025,1.0);}
+        return vec4f(v,v,v,1.0);
+      }`});
+    const pipeline = device.createRenderPipeline({
+      layout:'auto',
+      vertex:{module:shader,entryPoint:'vs'},
+      fragment:{module:shader,entryPoint:'fs',targets:[{format}]},
+      primitive:{topology:'triangle-list'}
+    });
+    const encoder=device.createCommandEncoder();
+    const pass=encoder.beginRenderPass({
+      colorAttachments:[{view:context.getCurrentTexture().createView(),clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}]
+    });
+    pass.setPipeline(pipeline); pass.draw(6); pass.end();
+    device.queue.submit([encoder.finish()]);
+    running=true; startBtn.disabled=true; stopBtn.disabled=false;
+    status('WebGPU запущен. Проверяй, отличаются ли плашки 1.25×–3× от 1×.', 'good');
+  } catch(e) {
+    status('Не удалось включить EDR: '+(e?.message||e), 'bad');
+    fallback();
+  }
+}
+startBtn.addEventListener('click',init);
+stopBtn.addEventListener('click',()=>{
+  running=false;
+  if(device){device.destroy();device=null;}
+  startBtn.disabled=false; stopBtn.disabled=true;
+  status('Тест остановлен. Для повторной проверки нажми «Включить EDR-тест».');
+  fallback();
+});
+fallback();
+</script>
+</body>
+</html>
